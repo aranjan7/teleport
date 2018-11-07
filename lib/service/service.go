@@ -41,10 +41,12 @@ import (
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/auth/native"
 	"github.com/gravitational/teleport/lib/backend"
-	"github.com/gravitational/teleport/lib/backend/boltbk"
-	"github.com/gravitational/teleport/lib/backend/dir"
 	"github.com/gravitational/teleport/lib/backend/dynamo"
 	"github.com/gravitational/teleport/lib/backend/etcdbk"
+	"github.com/gravitational/teleport/lib/backend/legacy"
+	"github.com/gravitational/teleport/lib/backend/legacy/boltbk"
+	"github.com/gravitational/teleport/lib/backend/legacy/dir"
+	"github.com/gravitational/teleport/lib/backend/lite"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
@@ -165,6 +167,14 @@ type Connector struct {
 	Client *auth.Client
 }
 
+// Close closes resources associated with connector
+func (c *Connector) Close() error {
+	if c.Client != nil {
+		return c.Close()
+	}
+	return nil
+}
+
 // TeleportProcess structure holds the state of the Teleport daemon, controlling
 // execution and configuration of the teleport services: ssh, auth and proxy.
 type TeleportProcess struct {
@@ -242,15 +252,6 @@ func (process *TeleportProcess) GetAuditLog() events.IAuditLog {
 // GetBackend returns the process' backend
 func (process *TeleportProcess) GetBackend() backend.Backend {
 	return process.backend
-}
-
-func (process *TeleportProcess) backendSupportsForks() bool {
-	switch process.backend.(type) {
-	case *boltbk.BoltBackend:
-		return false
-	default:
-		return true
-	}
 }
 
 func (process *TeleportProcess) findStaticIdentity(id auth.IdentityID) (*auth.Identity, error) {
@@ -907,6 +908,7 @@ func (process *TeleportProcess) initAuthService() error {
 		ReverseTunnels:       cfg.ReverseTunnels,
 		Trust:                cfg.Trust,
 		Presence:             cfg.Presence,
+		Events:               cfg.Events,
 		Provisioner:          cfg.Provisioner,
 		Identity:             cfg.Identity,
 		Access:               cfg.Access,
@@ -1020,7 +1022,7 @@ func (process *TeleportProcess) initAuthService() error {
 		// External integrations rely on this event:
 		process.BroadcastEvent(Event{Name: AuthIdentityEvent, Payload: connector})
 		process.onExit("auth.broadcast", func(payload interface{}) {
-			connector.Client.Close()
+			connector.Close()
 		})
 		return nil
 	})
@@ -1066,7 +1068,7 @@ func (process *TeleportProcess) initAuthService() error {
 			log.Warnf("Configuration setting auth_service/advertise_ip is not set. guessing %v.", srv.GetAddr())
 		}
 		// immediately register, and then keep repeating in a loop:
-		ticker := time.NewTicker(defaults.ServerHeartbeatTTL / 2)
+		ticker := time.NewTicker(defaults.ServerAnnounceTTL / 2)
 		defer ticker.Stop()
 	announce:
 		for {
@@ -1078,7 +1080,7 @@ func (process *TeleportProcess) initAuthService() error {
 			} else {
 				srv.Spec.Rotation = state.Spec.Rotation
 			}
-			srv.SetTTL(process, defaults.ServerHeartbeatTTL)
+			srv.SetTTL(process, defaults.ServerAnnounceTTL)
 			err = authServer.UpsertAuthServer(&srv)
 			if err != nil {
 				log.Warningf("Failed to announce presence: %v.", err)
@@ -1151,7 +1153,7 @@ func (process *TeleportProcess) newLocalCache(clt auth.ClientI, cacheName []stri
 	if err := os.MkdirAll(path, teleport.SharedDirMode); err != nil {
 		return nil, trace.ConvertSystemError(err)
 	}
-	cacheBackend, err := dir.New(backend.Params{"path": path})
+	cacheBackend, err := lite.NewWithConfig(context.TODO(), lite.Config{Path: path, EventsOff: true})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1305,7 +1307,7 @@ func (process *TeleportProcess) initSSH() error {
 func (process *TeleportProcess) registerWithAuthServer(role teleport.Role, eventName string) {
 	var authClient *auth.Client
 	process.RegisterCriticalFunc(fmt.Sprintf("register.%v", strings.ToLower(role.String())), func() error {
-		retryTime := defaults.ServerHeartbeatTTL / 3
+		retryTime := defaults.HighResPollingPeriod
 		for {
 			connector, err := process.connectToAuthService(role)
 			if err == nil {
@@ -1992,18 +1994,42 @@ func (process *TeleportProcess) initAuthStorage() (bk backend.Backend, err error
 	bc := &process.Config.Auth.StorageConfig
 	process.Debugf("Using %v backend.", bc.Type)
 	switch bc.Type {
-	// legacy bolt backend:
+	case lite.GetName():
+		bk, err = lite.New(context.TODO(), bc.Params)
+		// legacy bolt backend, import all data into SQLite and return
+		// SQLite data
 	case boltbk.GetName():
-		bk, err = boltbk.New(bc.Params)
-	// filesystem backend:
+		litebk, err := lite.New(context.TODO(), bc.Params)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		err = legacy.Import(context.TODO(), litebk, func() (legacy.Exporter, error) {
+			return boltbk.New(legacy.Params(bc.Params))
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		bk = litebk
+		// legacy filesystem backend, import all data into SQLite and return
+		// SQLite data
 	case dir.GetName():
-		bk, err = dir.New(bc.Params)
+		litebk, err := lite.New(context.TODO(), bc.Params)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		err = legacy.Import(context.TODO(), litebk, func() (legacy.Exporter, error) {
+			return dir.New(legacy.Params(bc.Params))
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		bk = litebk
 	// DynamoDB backend:
 	case dynamo.GetName():
-		bk, err = dynamo.New(bc.Params)
+		bk, err = dynamo.New(context.TODO(), bc.Params)
 	// etcd backend:
 	case etcdbk.GetName():
-		bk, err = etcdbk.New(bc.Params)
+		bk, err = etcdbk.New(context.TODO(), bc.Params)
 	default:
 		err = trace.BadParameter("unsupported secrets storage type: %q", bc.Type)
 	}

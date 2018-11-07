@@ -17,6 +17,8 @@ limitations under the License.
 package auth
 
 import (
+	"context"
+
 	"github.com/gravitational/teleport/lib/services"
 )
 
@@ -43,7 +45,7 @@ type AccessPoint interface {
 
 	// UpsertServer registers server presence, permanently if ttl is 0 or
 	// for the specified duration with second resolution if it's >= 1 second
-	UpsertNode(s services.Server) error
+	UpsertNode(s services.Server) (*services.KeepAlive, error)
 
 	// UpsertProxy registers server presence, permanently if ttl is 0 or
 	// for the specified duration with second resolution if it's >= 1 second
@@ -81,4 +83,7 @@ type AccessPoint interface {
 
 	// GetAllTunnelConnections returns all tunnel connections
 	GetAllTunnelConnections(opts ...services.MarshalOption) ([]services.TunnelConnection, error)
+
+	// NewKeepAliver returns a new instance of keep aliver
+	NewKeepAliver(ctx context.Context) (services.KeepAliver, error)
 }

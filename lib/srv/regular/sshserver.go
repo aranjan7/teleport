@@ -59,6 +59,8 @@ import (
 type Server struct {
 	sync.Mutex
 
+	*log.Entry
+
 	namespace string
 	addr      utils.NetAddr
 	hostname  string
@@ -89,8 +91,10 @@ type Server struct {
 	// this gets set to true for unit testing
 	isTestStub bool
 
-	// sets to true when the server needs to be stopped
-	closer *utils.CloseBroadcaster
+	// cancel cancels all operations
+	cancel context.CancelFunc
+	// ctx is broadcasting context closure
+	ctx context.Context
 
 	// alog points to the AuditLog this server uses to report
 	// auditable events
@@ -126,6 +130,10 @@ type Server struct {
 
 	// dataDir is a server local data directory
 	dataDir string
+
+	// heartbeat sends updates about this server
+	// back to auth server
+	heartbeat *heartbeat
 }
 
 // GetClock returns server clock implementation
@@ -188,8 +196,14 @@ type ServerOption func(s *Server) error
 
 // Close closes listening socket and stops accepting connections
 func (s *Server) Close() error {
-	s.closer.Close()
+	s.cancel()
 	s.reg.Close()
+	if s.heartbeat != nil {
+		if err := s.heartbeat.Close(); err != nil {
+			s.Warningf("Failed to close heartbeat: %v", err)
+		}
+		s.heartbeat = nil
+	}
 	return s.srv.Close()
 }
 
@@ -197,8 +211,14 @@ func (s *Server) Close() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	// wait until connections drain off
 	err := s.srv.Shutdown(ctx)
-	s.closer.Close()
+	s.cancel()
 	s.reg.Close()
+	if s.heartbeat != nil {
+		if err := s.heartbeat.Close(); err != nil {
+			s.Warningf("Failed to close heartbeat: %v", err)
+		}
+		s.heartbeat = nil
+	}
 	return err
 }
 
@@ -207,7 +227,6 @@ func (s *Server) Start() error {
 	if len(s.getCommandLabels()) > 0 {
 		s.updateLabels()
 	}
-	go s.heartbeatPresence()
 	return s.srv.Start()
 }
 
@@ -216,7 +235,6 @@ func (s *Server) Serve(l net.Listener) error {
 	if len(s.getCommandLabels()) > 0 {
 		s.updateLabels()
 	}
-	go s.heartbeatPresence()
 	return s.srv.Serve(l)
 }
 
@@ -300,6 +318,14 @@ func SetAuditLog(alog events.IAuditLog) ServerOption {
 	}
 }
 
+// SetUUID sets server unique ID
+func SetUUID(uuid string) ServerOption {
+	return func(s *Server) error {
+		s.uuid = uuid
+		return nil
+	}
+}
+
 func SetNamespace(namespace string) ServerOption {
 	return func(s *Server) error {
 		s.namespace = namespace
@@ -359,6 +385,7 @@ func New(addr utils.NetAddr,
 		return nil, trace.Wrap(err)
 	}
 
+	ctx, cancel := context.WithCancel(context.TODO())
 	s := &Server{
 		addr:            addr,
 		authService:     authService,
@@ -367,7 +394,8 @@ func New(addr utils.NetAddr,
 		advertiseIP:     advertiseIP,
 		proxyPublicAddr: proxyPublicAddr,
 		uuid:            uuid,
-		closer:          utils.NewCloseBroadcaster(),
+		cancel:          cancel,
+		ctx:             ctx,
 		clock:           clockwork.NewRealClock(),
 		dataDir:         dataDir,
 	}
@@ -397,6 +425,11 @@ func New(addr utils.NetAddr,
 	} else {
 		component = teleport.ComponentNode
 	}
+
+	s.Entry = log.WithFields(log.Fields{
+		trace.Component:       component,
+		trace.ComponentFields: log.Fields{},
+	})
 
 	s.reg, err = srv.NewSessionRegistry(s)
 	if err != nil {
@@ -433,6 +466,22 @@ func New(addr utils.NetAddr,
 		return nil, trace.Wrap(err)
 	}
 	s.srv = server
+
+	heartbeat, err := newHeartbeat(heartbeatConfig{
+		proxyMode:       s.proxyMode,
+		ctx:             ctx,
+		component:       component,
+		accessPoint:     s.authService,
+		getServerInfo:   s.getServerInfo,
+		keepAlivePeriod: defaults.ServerKeepAliveTTL,
+		announcePeriod:  defaults.ServerAnnounceTTL/2 + utils.RandomDuration(defaults.ServerAnnounceTTL/10),
+		clock:           s.clock,
+	})
+	if err != nil {
+		s.srv.Close()
+		return nil, trace.Wrap(err)
+	}
+	s.heartbeat = heartbeat
 	return s, nil
 }
 
@@ -520,8 +569,7 @@ func (s *Server) GetInfo() services.Server {
 	}
 }
 
-// registerServer attempts to register server in the cluster
-func (s *Server) registerServer() error {
+func (s *Server) getServerInfo() (services.Server, error) {
 	server := s.GetInfo()
 	if s.getRotation != nil {
 		rotation, err := s.getRotation(s.getRole())
@@ -533,35 +581,8 @@ func (s *Server) registerServer() error {
 			server.SetRotation(*rotation)
 		}
 	}
-	server.SetTTL(s.clock, defaults.ServerHeartbeatTTL)
-	if !s.proxyMode {
-		return trace.Wrap(s.authService.UpsertNode(server))
-	}
-	server.SetPublicAddr(s.proxyPublicAddr.String())
-	return trace.Wrap(s.authService.UpsertProxy(server))
-}
-
-// heartbeatPresence periodically calls into the auth server to let everyone
-// know we're up & alive
-func (s *Server) heartbeatPresence() {
-	sleepTime := defaults.ServerHeartbeatTTL/2 + utils.RandomDuration(defaults.ServerHeartbeatTTL/10)
-	ticker := time.NewTicker(sleepTime)
-	defer ticker.Stop()
-
-	for {
-		if err := s.registerServer(); err != nil {
-			log.Warningf("failed to announce %v presence: %v", s.ID(), err)
-		}
-		select {
-		case <-ticker.C:
-			continue
-		case <-s.closer.C:
-			{
-				log.Debugf("server.heartbeatPresence() exited")
-				return
-			}
-		}
-	}
+	server.SetTTL(s.clock, defaults.ServerAnnounceTTL)
+	return server, nil
 }
 
 func (s *Server) updateLabels() {
